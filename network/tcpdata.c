@@ -5,7 +5,7 @@
 #define SRCIP "192.168.1.132"
 #define DSTIP "192.168.1.177"
 #define SRCPORT 31143
-#define DSTPORT 80
+#define DSTPORT 4869
 #define PACKETSIZE 4096
 
 typedef struct ether {
@@ -52,50 +52,61 @@ unsigned short csum(unsigned short *buf, int size);
 int craftTCP(etherHdr *eh, ipHdr *iph, tcpHdr *tcph, int flag, int recvSeqNo,
              int recvAckNo);
 pcap_t * openNetworkDevice();
+unsigned char *data;
 
 int main(int argc, char *argv[]) {
-    unsigned char packet[PACKETSIZE];
+    unsigned char packet[PACKETSIZE] = {0};
     etherHdr *eh = (etherHdr *) packet;
     ipHdr *iph = (ipHdr *) &packet[sizeof(etherHdr)], *iphx;
     tcpHdr *tcph = (tcpHdr *) &packet[sizeof(etherHdr) + sizeof(ipHdr)], *tcphx;
+    data = &packet[sizeof(etherHdr) + sizeof(ipHdr) + sizeof(tcpHdr)];
     int len, result;
     struct pcap_pkthdr *pktHdr;
     const unsigned char *pktData;
 
     pcap_t *adhandle = openNetworkDevice();
 
-    // Send SYN (SYN_SENT)
     memset(packet, 0, PACKETSIZE);
+
+    // Send SYN (SYN_SENT)
     len = craftTCP(eh, iph, tcph, 0, 0, 0);
     pcap_sendpacket(adhandle, packet, len);
 
     while ((result = pcap_next_ex(adhandle, &pktHdr, &pktData)) >= 0) {
         if (result == 0) continue;
-
         // Capture SYN-ACK
         iphx = (ipHdr *) (pktData + 14);
         tcphx = (tcpHdr *) (pktData + 34);
         if (iphx->src == inet_addr(DSTIP) && ntohs(tcphx->dstPort) == SRCPORT
-            && tcphx->syn == 1 && tcphx->ack == 1
-            && ntohl(tcphx->ackSeq) == ntohl(tcph->seq) + 1) break;
+            && tcphx->syn == 1 && tcphx->ack == 1) break;
     }
 
     // Send ACK after receiving SYN-ACK (ESTABLISHED)
-    memset(packet, 0, PACKETSIZE);
     len = craftTCP(eh, iph, tcph, 1, ntohl(tcphx->seq), ntohl(tcphx->ackSeq));
     pcap_sendpacket(adhandle, packet, len);
     printf("Connection [ESTABLISHED]\n");
 
-    Sleep(4869);
+    Sleep(1000);
 
-    // Send FIN-ACK
-    memset(packet, 0, PACKETSIZE);
-    len = craftTCP(eh, iph, tcph, 2, ntohl(tcphx->seq), ntohl(tcphx->ackSeq));
+    // Send data
+    len = craftTCP(eh, iph, tcph, 3, ntohl(tcphx->seq), ntohl(tcphx->ackSeq));
     pcap_sendpacket(adhandle, packet, len);
 
     while ((result = pcap_next_ex(adhandle, &pktHdr, &pktData)) >= 0) {
         if (result == 0) continue;
+        // Capture ACK
+        iphx = (ipHdr *) (pktData + 14);
+        tcphx = (tcpHdr *) (pktData + 34);
+        if (iphx->src == inet_addr(DSTIP) && ntohs(tcphx->dstPort) == SRCPORT
+            && tcphx->ack == 1) break;
+    }
 
+    // Send FIN-ACK
+    len = craftTCP(eh, iph, tcph, 2, ntohl(tcphx->seq) - 1, ntohl(tcphx->ackSeq));
+    pcap_sendpacket(adhandle, packet, len);
+
+    while ((result = pcap_next_ex(adhandle, &pktHdr, &pktData)) >= 0) {
+        if (result == 0) continue;
         // Capture FIN-ACK (LAST_ACK)
         iphx = (ipHdr *) (pktData + 14);
         tcphx = (tcpHdr *) (pktData + 34);
@@ -104,7 +115,6 @@ int main(int argc, char *argv[]) {
     }
 
     // Send ACK after receiving FIN-ACK (CLOSED)
-    memset(packet, 0, PACKETSIZE);
     len = craftTCP(eh, iph, tcph, 1, ntohl(tcphx->seq), ntohl(tcphx->ackSeq));
     pcap_sendpacket(adhandle, packet, len);
     printf("Connection [CLOSED]\n");
@@ -126,6 +136,11 @@ unsigned short csum(unsigned short *buf, int size) {
 
 int craftTCP(etherHdr *eh, ipHdr *iph, tcpHdr *tcph, int flag, int recvSeqNo,
              int recvAckNo) {
+    // Data
+    char msg[] = "Goodnight, Miss Anmingle^^";
+    size_t msgLen = strlen(msg);
+    memcpy(data, msg, msgLen);
+
     // Ethernet header
     eh->dst[0] = 0x8c; eh->dst[1] = 0xdc; eh->dst[2] = 0xd4;
     eh->dst[3] = 0x32; eh->dst[4] = 0x82; eh->dst[5] = 0x34;
@@ -138,6 +153,7 @@ int craftTCP(etherHdr *eh, ipHdr *iph, tcpHdr *tcph, int flag, int recvSeqNo,
     iph->headerLength = 5;
     iph->typeOfService = 0;
     iph->totalLength = htons(sizeof(ipHdr) + sizeof(tcpHdr));
+    if (flag == 3) iph->totalLength = htons(sizeof(ipHdr) + sizeof(tcpHdr) + msgLen);
     iph->id = htons(31143);
     iph->fragmentOffset = 0;
     iph->ttl = 64;
@@ -156,7 +172,7 @@ int craftTCP(etherHdr *eh, ipHdr *iph, tcpHdr *tcph, int flag, int recvSeqNo,
         tcph->ackSeq = htonl(0);
         tcph->ack = 0;
         tcph->syn = 1;
-    } else if (flag == 1 || flag == 2) { // ACK or FIN-ACK
+    } else if (flag == 1 || flag == 2 || flag == 3) { // ACK or FIN-ACK or PSH-ACK
         tcph->seq = htonl(recvAckNo);
         tcph->ackSeq = htonl(recvSeqNo + 1);
         tcph->ack = 1;
@@ -167,7 +183,7 @@ int craftTCP(etherHdr *eh, ipHdr *iph, tcpHdr *tcph, int flag, int recvSeqNo,
     tcph->cwr = 0;
     tcph->ece = 0;
     tcph->urg = 0;
-    tcph->psh = 0;
+    tcph->psh = flag == 3 ? 1 : 0;
     tcph->rst = 0;
     tcph->fin = flag == 2 ? 1 : 0;
     tcph->windowSize = htons(65535);
@@ -180,12 +196,17 @@ int craftTCP(etherHdr *eh, ipHdr *iph, tcpHdr *tcph, int flag, int recvSeqNo,
     ph.dst = iph->dst;
     ph.zeros = 0;
     ph.protocol = IPPROTO_TCP;
-    ph.tcpLength = htons(sizeof(tcpHdr));
+    ph.tcpLength = flag != 3 ? htons(sizeof(tcpHdr)) : htons(sizeof(tcpHdr) + msgLen);
     ph.tcph = *tcph;
     char buf[1024];
     memcpy(buf, &ph, sizeof(pseudoHdr));
+    if (flag == 3) memcpy(buf + sizeof(pseudoHdr), data, msgLen);
 
     tcph->checksum = csum((unsigned short *) buf, sizeof(pseudoHdr));
+    if (flag == 3) {
+        tcph->checksum = csum((unsigned short *) buf, sizeof(pseudoHdr) + msgLen);
+        return sizeof(etherHdr) + sizeof(ipHdr) + sizeof(tcpHdr) + msgLen;
+    }
 
     return sizeof(etherHdr) + sizeof(ipHdr) + sizeof(tcpHdr);
 }
